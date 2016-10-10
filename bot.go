@@ -1,11 +1,15 @@
 package eslacktivities
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
+	humanize "github.com/dustin/go-humanize"
 	"github.com/golang/glog"
 	"github.com/leekchan/accounting"
 	"github.com/lukegb/egotivities"
@@ -36,6 +40,10 @@ type BotOptions struct {
 
 	EActivitiesKey    string
 	EActivitiesCentre string
+
+	FacebookAppID     string
+	FacebookAppSecret string
+	FacebookPageName  string
 }
 
 // Bot responds to queries for eActivities data in Slack and returns useful information.
@@ -45,6 +53,9 @@ type Bot struct {
 
 	eactivities egotivities.Client
 	centreNum   string
+
+	facebookAccessToken string
+	facebookPageName    string
 }
 
 // Run initiates the Bot's message loop. It will not return, unless a fatal error occurs.
@@ -100,12 +111,26 @@ func (bot *Bot) handleMessage(msg *slack.Message) {
 	}
 	channel := msg.Channel
 	bot.rtm.SendMessage(bot.rtm.NewTypingMessage(channel))
-	resp, err := bot.handlePlainMessage(text)
-	switch {
-	case err != nil:
-		bot.rtm.SendMessage(bot.rtm.NewOutgoingMessage(fmt.Sprintf("An error occurred: %s", err), channel))
-	case resp != "":
-		bot.rtm.SendMessage(bot.rtm.NewOutgoingMessage(resp, channel))
+
+	switch text {
+	case "when's the next bar night", "next bar night", "bevs":
+		if err := bot.nextEvent(func(event *facebookEvent) bool {
+			return strings.Contains(strings.ToLower(event.Name), "bar night")
+		}, "bar night", channel); err != nil {
+			bot.rtm.SendMessage(bot.rtm.NewOutgoingMessage(fmt.Sprintf("An error occurred: %s", err), channel))
+		}
+	case "when's the next event", "next event":
+		if err := bot.nextEvent(nil, "event", channel); err != nil {
+			bot.rtm.SendMessage(bot.rtm.NewOutgoingMessage(fmt.Sprintf("An error occurred: %s", err), channel))
+		}
+	default:
+		resp, err := bot.handlePlainMessage(text)
+		switch {
+		case err != nil:
+			bot.rtm.SendMessage(bot.rtm.NewOutgoingMessage(fmt.Sprintf("An error occurred: %s", err), channel))
+		case resp != "":
+			bot.rtm.SendMessage(bot.rtm.NewOutgoingMessage(resp, channel))
+		}
 	}
 }
 
@@ -181,13 +206,129 @@ func (bot *Bot) handlePlainMessage(text string) (string, error) {
 	return "", nil
 }
 
+type facebookEvent struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	StartTime facebookTime `json:"start_time"`
+	EndTime   facebookTime `json:"end_time"`
+	Cover     struct {
+		Source string `json:"source"`
+	} `json:"cover"`
+	Place struct {
+		Name string `json:"name"`
+	} `json:"place"`
+	Description     string `json:"description"`
+	AttendingCount  uint   `json:"attending_count"`
+	InterestedCount uint   `json:"interested_count"`
+	MaybeCount      uint   `json:"maybe_count"`
+	NoReplyCount    uint   `json:"noreply_count"`
+	DeclinedCount   uint   `json:"declined_count"`
+}
+
+func (bot *Bot) nextEvent(predicate func(event *facebookEvent) bool, whatThing string, channel string) error {
+	resp, err := http.Get(fmt.Sprintf("https://graph.facebook.com/v2.8/%s?fields=events{name,category,start_time,end_time,id,cover,place,description,attending_count,interested_count,maybe_count,declined_count,noreply_count}&access_token=%s", bot.facebookPageName, bot.facebookAccessToken))
+	if err != nil {
+		return err
+	}
+	type fbData struct {
+		Events struct {
+			Data []facebookEvent `json:"data"`
+		} `json:"events"`
+	}
+	var events fbData
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return err
+	}
+	var nextEvent *facebookEvent
+	now := time.Now()
+	for _, event := range events.Events.Data {
+		event := event
+		if event.StartTime.Before(now) {
+			continue
+		}
+		if nextEvent != nil && nextEvent.StartTime.Before(event.StartTime.Time) {
+			continue
+		}
+		if predicate != nil && !predicate(&event) {
+			continue
+		}
+		nextEvent = &event
+	}
+	pmp := slack.PostMessageParameters{
+		AsUser: true,
+	}
+	if nextEvent == nil {
+		pmp.Text = fmt.Sprintf("I couldn't find any %ss on our Facebook page 😿", whatThing)
+	} else {
+		pmp.Text = fmt.Sprintf("Looks like *%s* is our next %s, _%s_.", nextEvent.Name, whatThing, humanize.Time(nextEvent.StartTime.Time))
+		att := slack.Attachment{
+			ImageURL:  nextEvent.Cover.Source,
+			Title:     nextEvent.Name,
+			TitleLink: fmt.Sprintf("https://www.facebook.com/events/%s/", nextEvent.ID),
+			Text:      nextEvent.Description,
+			Fields: []slack.AttachmentField{
+				{
+					Title: "When",
+					Value: nextEvent.StartTime.Format("Mon Jan 2"),
+				},
+				{
+					Title: "Where",
+					Value: nextEvent.Place.Name,
+				},
+				{
+					Title: "Going",
+					Value: fmt.Sprintf("%d", nextEvent.AttendingCount),
+					Short: true,
+				},
+				{
+					Title: "Interested",
+					Value: fmt.Sprintf("%d", nextEvent.InterestedCount),
+					Short: true,
+				},
+				{
+					Title: "Declined",
+					Value: fmt.Sprintf("%d", nextEvent.DeclinedCount),
+					Short: true,
+				},
+				{
+					Title: "Not Replied",
+					Value: fmt.Sprintf("%d", nextEvent.NoReplyCount),
+					Short: true,
+				},
+			},
+		}
+		pmp.Attachments = []slack.Attachment{att}
+	}
+	_, _, err = bot.api.PostMessage(channel, pmp.Text, pmp)
+	return err
+}
+
 // New creates a new Bot.
 func New(opts BotOptions) (*Bot, error) {
 	api := slack.New(opts.Token)
 	client := egotivities.NewClient(opts.EActivitiesKey)
 	return &Bot{
-		api:         api,
+		api: api,
+
 		eactivities: client,
 		centreNum:   opts.EActivitiesCentre,
+
+		facebookAccessToken: fmt.Sprintf("%s|%s", opts.FacebookAppID, opts.FacebookAppSecret),
+		facebookPageName:    opts.FacebookPageName,
 	}, nil
+}
+
+type facebookTime struct {
+	time.Time
+}
+
+func (fbt *facebookTime) UnmarshalJSON(b []byte) error {
+	var x string
+	if err := json.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	t, err := time.Parse("2006-01-02T15:04:05-0700", x)
+	fbt.Time = t
+	return err
 }
